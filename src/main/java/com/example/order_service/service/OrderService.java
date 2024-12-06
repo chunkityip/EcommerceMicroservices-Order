@@ -5,50 +5,71 @@ import com.example.order_service.dto.OrderRequest;
 import com.example.order_service.event.OrderPlaceEvent;
 import com.example.order_service.model.Order;
 import com.example.order_service.repo.OrderRepo;
+import io.micrometer.observation.Observation;
+import io.micrometer.observation.ObservationRegistry;
 import lombok.RequiredArgsConstructor;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.reactive.function.client.WebClient;
 
+import java.util.List;
 import java.util.UUID;
 
 @Service
-@Slf4j
 @RequiredArgsConstructor
+@Transactional
+@Slf4j
 public class OrderService {
 
-    private final OrderRepo orderRepo;
-    private final InventoryClient inventoryClient;
-    private final KafkaTemplate<String, OrderPlaceEvent> kafkaTemplate;
+    private final OrderRepo orderRepository;
+    private final WebClient.Builder webClientBuilder;
+    private final ObservationRegistry observationRegistry;
+    private final ApplicationEventPublisher applicationEventPublisher;
 
-    public void placeOrder(OrderRequest orderRequest) {
-        var isProductInStock = inventoryClient.isInStock(
-                orderRequest.skuCode(),
-                orderRequest.quantity());
-
-        if (isProductInStock) {
-            Order order = new Order();
-            order.setOrderNumber(UUID.randomUUID().toString());
-            order.setPrice(orderRequest.price());
-            order.setSkuCode(orderRequest.skuCode());
-            order.setQuantity(orderRequest.quantity());
-            orderRepo.save(order);
-
-            // Send the message to Kafka Topic
-            OrderPlaceEvent orderPlaceEvent = new OrderPlaceEvent(order.getOrderNumber() , orderRequest.userDetails().email());
-            log.info("Start - Sending OrderPlacedEvent {} to Kafka topic order-placed", orderPlaceEvent);
-            kafkaTemplate.send("order-placed", orderPlaceEvent);
-            log.info("End - Sending OrderPlacedEvent {} to Kafka topic order-placed", orderPlaceEvent);
-        } else {
-            throw new RuntimeException("Product with SkuCode" +
-                    orderRequest.skuCode() + "is not in stock");
-        }
-
+    public String placeOrder(OrderRequest orderRequest) {
         Order order = new Order();
         order.setOrderNumber(UUID.randomUUID().toString());
-        order.setPrice(orderRequest.price());
-        order.setSkuCode(orderRequest.skuCode());
-        order.setQuantity(orderRequest.quantity());
-        orderRepo.save(order);
+
+        List<OrderLineItems> orderLineItems = orderRequest.getOrderLineItemsDtoList()
+                .stream()
+                .map(this::mapToDto)
+                .toList();
+
+        order.setOrderLineItemsList(orderLineItems);
+
+        List<String> skuCodes = order.getOrderLineItemsList().stream()
+                .map(OrderLineItems::getSkuCode)
+                .toList();
+
+        // Call Inventory Service, and place order if product is in
+        // stock
+        Observation inventoryServiceObservation = Observation.createNotStarted("inventory-service-lookup",
+                this.observationRegistry);
+        inventoryServiceObservation.lowCardinalityKeyValue("call", "inventory-service");
+        return inventoryServiceObservation.observe(() -> {
+            InventoryResponse[] inventoryResponseArray = webClientBuilder.build().get()
+                    .uri("http://inventory-service/api/inventory",
+                            uriBuilder -> uriBuilder.queryParam("skuCode", skuCodes).build())
+                    .retrieve()
+                    .bodyToMono(InventoryResponse[].class)
+                    .block();
+
+            boolean allProductsInStock = Arrays.stream(inventoryResponseArray)
+                    .allMatch(InventoryResponse::isInStock);
+
+            if (allProductsInStock) {
+                orderRepository.save(order);
+                // publish Order Placed Event
+                applicationEventPublisher.publishEvent(new OrderPlacedEvent(this, order.getOrderNumber()));
+                return "Order Placed";
+            } else {
+                throw new IllegalArgumentException("Product is not in stock, please try again later");
+            }
+        });
+
     }
+
 }
